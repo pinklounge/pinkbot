@@ -2,32 +2,24 @@ import os
 import re
 import time
 import sqlite3
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import telebot
 from telebot import apihelper
-from telebot.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ReplyKeyboardRemove,
-)
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
-# ================== CONFIG (.env) ==================
-TOKEN = "8527527033:AAEzO4YbUuvhJGuyZ4v8cNn3JVYnBlmH-ro"  
-ADMIN_ID = 641359493
-# export BOOK_URL="https://www.instagram.com/rozhevyi.sushi.lounge/"
-# export DB_FILE="pink_lounge.db"
+# ================== CONFIG ==================
+# Railway Variables (recommended):
+# BOT_TOKEN, ADMIN_ID, BOOK_URL, DB_FILE
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 if not TOKEN or ":" not in TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN is missing or invalid. Set env BOT_TOKEN like 123456:ABC...")
+    raise RuntimeError("❌ BOT_TOKEN is missing/invalid. Set Railway Variable BOT_TOKEN.")
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-if ADMIN_ID <= 0:
-    raise RuntimeError("❌ ADMIN_ID is missing. Set env ADMIN_ID to your Telegram user id (number).")
-
-BOOK_URL = os.getenv("BOOK_URL", "https://www.instagram.com/rozhevyi.sushi.lounge/").strip()
-DB_FILE = os.getenv("DB_FILE", "pink_lounge.db").strip()
+ADMIN_ID = int((os.getenv("ADMIN_ID") or "0").strip() or "0")  # can be 0 if not set (no admin)
+BOOK_URL = (os.getenv("BOOK_URL") or "https://www.instagram.com/rozhevyi.sushi.lounge/").strip()
+DB_FILE = (os.getenv("DB_FILE") or "pink_lounge.db").strip()
 
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 
@@ -321,10 +313,6 @@ def init_db():
         )
     """)
 
-    # indexes
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_chat ON feedback(chat_id)")
-
     conn.commit()
     conn.close()
 
@@ -332,7 +320,6 @@ def migrate_db():
     conn = db()
     cur = conn.cursor()
 
-    # ui older DBs
     for col in ("aux_message_id", "admin_message_id", "main_kind"):
         if not _column_exists(cur, "ui", col):
             if col == "main_kind":
@@ -340,11 +327,9 @@ def migrate_db():
             else:
                 cur.execute(f"ALTER TABLE ui ADD COLUMN {col} INTEGER")
 
-    # users: favorite_mix
     if not _column_exists(cur, "users", "favorite_mix"):
         cur.execute("ALTER TABLE users ADD COLUMN favorite_mix TEXT")
 
-    # state: awaiting_fav_mix + pending_fav_item_key
     if not _column_exists(cur, "state", "awaiting_fav_mix"):
         cur.execute("ALTER TABLE state ADD COLUMN awaiting_fav_mix INTEGER DEFAULT 0")
     if not _column_exists(cur, "state", "pending_fav_item_key"):
@@ -357,18 +342,9 @@ def ensure_user(chat_id: int):
     conn = db()
     cur = conn.cursor()
 
-    cur.execute(
-        "INSERT OR IGNORE INTO users(chat_id, created_at) VALUES(?, ?)",
-        (chat_id, utcnow().isoformat())
-    )
-    cur.execute(
-        "INSERT OR IGNORE INTO state(chat_id, awaiting_comment, awaiting_fav_mix) VALUES(?, 0, 0)",
-        (chat_id,)
-    )
-    cur.execute(
-        "INSERT OR IGNORE INTO settings(chat_id, admin_mode) VALUES(?, 0)",
-        (chat_id,)
-    )
+    cur.execute("INSERT OR IGNORE INTO users(chat_id, created_at) VALUES(?, ?)", (chat_id, utcnow().isoformat()))
+    cur.execute("INSERT OR IGNORE INTO state(chat_id, awaiting_comment, awaiting_fav_mix) VALUES(?, 0, 0)", (chat_id,))
+    cur.execute("INSERT OR IGNORE INTO settings(chat_id, admin_mode) VALUES(?, 0)", (chat_id,))
     cur.execute("""
         INSERT OR IGNORE INTO ui(chat_id, main_message_id, aux_message_id, admin_message_id, main_kind)
         VALUES(?, NULL, NULL, NULL, 'text')
@@ -494,7 +470,7 @@ def extract_table_code(raw: str | None) -> str | None:
     if not raw:
         return None
     sp = raw.strip().lower()
-    m = re.match(r"^(t\d+)", sp)
+    m = re.match(r"^(t\d+)$", sp)
     return m.group(1) if m else None
 
 def try_checkin(chat_id: int, table_code: str | None):
@@ -523,10 +499,7 @@ def try_checkin(chat_id: int, table_code: str | None):
 def set_favorite_mix(chat_id: int, item_key: str, mix_text: str | None):
     conn = db()
     cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET favorite_key=?, favorite_mix=? WHERE chat_id=?",
-        (item_key, mix_text, chat_id),
-    )
+    cur.execute("UPDATE users SET favorite_key=?, favorite_mix=? WHERE chat_id=?", (item_key, mix_text, chat_id))
     conn.commit()
     conn.close()
 
@@ -644,7 +617,7 @@ def load_media_and_overrides():
 
     conn.close()
 
-# ================== SCREEN SYSTEM (TEXT/PHOTO IN ONE MESSAGE) ==================
+# ================== SCREEN SYSTEM ==================
 def screen_text(chat_id: int, text: str, kb: InlineKeyboardMarkup):
     ui = get_ui(chat_id)
     mid = ui["main_message_id"] if ui else None
@@ -675,13 +648,7 @@ def screen_photo(chat_id: int, photo_file_id: str, caption: str, kb: InlineKeybo
 
     if mid:
         try:
-            bot.edit_message_caption(
-                chat_id=chat_id,
-                message_id=mid,
-                caption=caption,
-                reply_markup=kb,
-                parse_mode="Markdown",
-            )
+            bot.edit_message_caption(chat_id=chat_id, message_id=mid, caption=caption, reply_markup=kb, parse_mode="Markdown")
             return
         except Exception:
             safe_delete(chat_id, mid)
@@ -1011,6 +978,8 @@ def detect_doc_kind(document) -> str | None:
     return None
 
 def admin_send(text: str, kb=None):
+    if ADMIN_ID <= 0:
+        return None
     if not is_admin_mode(ADMIN_ID):
         ui = get_ui(ADMIN_ID)
         if ui:
@@ -1019,27 +988,6 @@ def admin_send(text: str, kb=None):
     if not is_admin_mode(ADMIN_ID):
         set_ui_fields(ADMIN_ID, admin_message_id=msg.message_id)
     return msg
-
-# ================== SEND WITH BACKOFF (broadcast) ==================
-def _retry_after_seconds(exc: Exception) -> int | None:
-    s = str(exc).lower()
-    m = re.search(r"retry after (\d+)", s)
-    if m:
-        return int(m.group(1))
-    return None
-
-def send_with_backoff(fn, *args, **kwargs) -> bool:
-    for _ in range(4):
-        try:
-            fn(*args, **kwargs)
-            return True
-        except Exception as e:
-            ra = _retry_after_seconds(e)
-            if ra:
-                time.sleep(min(ra + 1, 20))
-                continue
-            time.sleep(0.2)
-    return False
 
 # ================== COMMANDS ==================
 @bot.message_handler(commands=["start", "menu"])
@@ -1069,7 +1017,7 @@ def start(message):
 
 @bot.message_handler(commands=["admin"])
 def admin_cmd(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     ensure_user(ADMIN_ID)
     mode = "ON ✅" if is_admin_mode(ADMIN_ID) else "OFF ⛔"
@@ -1077,7 +1025,7 @@ def admin_cmd(message):
 
 @bot.message_handler(commands=["adminmode"])
 def adminmode_cmd(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
@@ -1090,13 +1038,13 @@ def adminmode_cmd(message):
 
 @bot.message_handler(commands=["keys"])
 def keys_cmd(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     admin_send(list_keys_text(), kb_admin_quick())
 
 @bot.message_handler(commands=["setphoto"])
 def setphoto_cmd(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
@@ -1112,7 +1060,7 @@ def setphoto_cmd(message):
 
 @bot.message_handler(commands=["setvideo"])
 def setvideo_cmd(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
@@ -1128,7 +1076,7 @@ def setvideo_cmd(message):
 
 @bot.message_handler(commands=["delphoto"])
 def delphoto_cmd(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
@@ -1143,7 +1091,7 @@ def delphoto_cmd(message):
 
 @bot.message_handler(commands=["delvideo"])
 def delvideo_cmd(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
@@ -1158,7 +1106,7 @@ def delvideo_cmd(message):
 
 @bot.message_handler(commands=["setprice"])
 def setprice_cmd(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
@@ -1180,7 +1128,7 @@ def setprice_cmd(message):
 
 @bot.message_handler(commands=["settitle"])
 def settitle_cmd(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
@@ -1195,7 +1143,7 @@ def settitle_cmd(message):
 
 @bot.message_handler(commands=["setdesc"])
 def setdesc_cmd(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
@@ -1210,7 +1158,7 @@ def setdesc_cmd(message):
 
 @bot.message_handler(commands=["broadcast"])
 def broadcast_text(message):
-    if message.from_user.id != ADMIN_ID:
+    if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
         return
     text = (message.text or "").replace("/broadcast", "").strip()
     if not text:
@@ -1225,293 +1173,298 @@ def broadcast_text(message):
 
     ok = 0
     for uid in users:
-        if send_with_backoff(bot.send_message, uid, text):
+        try:
+            bot.send_message(uid, text)
             ok += 1
-        time.sleep(0.03)
+            time.sleep(0.05)
+        except Exception:
+            pass
     admin_send(f"✅ Розсилка: {ok}/{len(users)}")
 
 # ================== MEDIA HANDLER ==================
 @bot.message_handler(content_types=["photo", "video", "document"])
 def media_router(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    caption = (message.caption or "").strip()
-
-    kind = None
-    file_id = None
-
-    if message.content_type == "photo":
-        kind = "photo"
-        file_id = message.photo[-1].file_id
-    elif message.content_type == "video":
-        kind = "video"
-        file_id = message.video.file_id
-    elif message.content_type == "document":
-        kind = detect_doc_kind(message.document)
-        if kind:
-            file_id = message.document.file_id
-        else:
+    try:
+        if ADMIN_ID <= 0 or message.from_user.id != ADMIN_ID:
             return
 
-    st = admin_state_get()
-    if st:
-        key = st["item_key"]
-        mode = st["mode"]
+        caption = (message.caption or "").strip()
 
-        if mode == "setphoto" and kind == "photo":
-            admin_state_set(None, None)
-            if find_item(key)[1]:
-                media_set(key, "photo", file_id)
-                admin_send(f"✅ Фото привʼязано для `{key}`")
+        kind = None
+        file_id = None
+
+        if message.content_type == "photo":
+            kind = "photo"
+            file_id = message.photo[-1].file_id
+        elif message.content_type == "video":
+            kind = "video"
+            file_id = message.video.file_id
+        elif message.content_type == "document":
+            kind = detect_doc_kind(message.document)
+            if kind:
+                file_id = message.document.file_id
             else:
-                admin_send("❗️KEY не знайдено. `/keys`")
-            return
+                return
 
-        if mode == "setvideo" and kind == "video":
-            admin_state_set(None, None)
-            if find_item(key)[1]:
-                media_set(key, "video", file_id)
-                admin_send(f"✅ Відео привʼязано для `{key}`")
-            else:
-                admin_send("❗️KEY не знайдено. `/keys`")
-            return
+        st = admin_state_get()
+        if st:
+            key = st["item_key"]
+            mode = st["mode"]
 
-    if caption.lower().startswith("broadcast:"):
-        text = caption[len("broadcast:"):].strip() or "🌸 Pink Lounge"
+            if mode == "setphoto" and kind == "photo":
+                admin_state_set(None, None)
+                if find_item(key)[1]:
+                    media_set(key, "photo", file_id)
+                    admin_send(f"✅ Фото привʼязано для `{key}`")
+                else:
+                    admin_send("❗️KEY не знайдено. `/keys`")
+                return
 
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT chat_id FROM users")
-        users = [int(r["chat_id"]) for r in cur.fetchall()]
-        conn.close()
+            if mode == "setvideo" and kind == "video":
+                admin_state_set(None, None)
+                if find_item(key)[1]:
+                    media_set(key, "video", file_id)
+                    admin_send(f"✅ Відео привʼязано для `{key}`")
+                else:
+                    admin_send("❗️KEY не знайдено. `/keys`")
+                return
 
-        ok = 0
-        for uid in users:
-            if kind == "photo":
-                if send_with_backoff(bot.send_photo, uid, file_id, caption=text):
+        if caption.lower().startswith("broadcast:"):
+            text = caption[len("broadcast:"):].strip() or "🌸 Pink Lounge"
+
+            conn = db()
+            cur = conn.cursor()
+            cur.execute("SELECT chat_id FROM users")
+            users = [int(r["chat_id"]) for r in cur.fetchall()]
+            conn.close()
+
+            ok = 0
+            for uid in users:
+                try:
+                    if kind == "photo":
+                        bot.send_photo(uid, file_id, caption=text)
+                    else:
+                        bot.send_video(uid, file_id, caption=text)
                     ok += 1
-            else:
-                if send_with_backoff(bot.send_video, uid, file_id, caption=text):
-                    ok += 1
-            time.sleep(0.05 if kind == "video" else 0.04)
+                    time.sleep(0.08 if kind == "video" else 0.06)
+                except Exception:
+                    pass
+            admin_send(f"✅ {('Відео' if kind=='video' else 'Фото')}-розсилка: {ok}/{len(users)}")
+            return
 
-        admin_send(f"✅ {('Відео' if kind=='video' else 'Фото')}-розсилка: {ok}/{len(users)}")
-        return
+    except Exception:
+        print("❌ MEDIA CRASH:\n", traceback.format_exc())
 
-# ================== CALLBACKS ==================
+# ================== CALLBACKS (ANTI-CRASH) ==================
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(call):
-    chat_id = call.message.chat.id
-    data = call.data or ""
-
     try:
-        bot.answer_callback_query(call.id)
-    except Exception:
-        pass
+        chat_id = call.message.chat.id if call.message else call.from_user.id
+        data = call.data or ""
 
-    ensure_user(chat_id)
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
 
-    if data.startswith(("go:", "cat:", "item:", "fav:", "fb", "rate:", "admin:", "adminmode:", "skip_comment", "favmix:")):
-        typing(chat_id)
+        ensure_user(chat_id)
 
-    if data == "go:home":
-        set_state(chat_id, 0, None, None, None)
-        set_fav_mix_state(chat_id, 0, None)
-        return render_home(chat_id)
+        if data.startswith(("go:", "cat:", "item:", "fav:", "fb", "rate:", "admin:", "adminmode:", "favmix:")) or data in ("skip_comment",):
+            typing(chat_id)
 
-    if data.startswith("cat:"):
-        category = data.split("cat:", 1)[1]
-        if category in MENU:
+        if data == "go:home":
             set_state(chat_id, 0, None, None, None)
             set_fav_mix_state(chat_id, 0, None)
-            return render_category(chat_id, category)
-        return render_home(chat_id)
+            return render_home(chat_id)
 
-    if data.startswith("item:"):
-        key = data.split("item:", 1)[1]
-        set_state(chat_id, 0, None, None, None)
-        set_fav_mix_state(chat_id, 0, None)
-        return render_item(chat_id, key)
+        if data.startswith("cat:"):
+            category = data.split("cat:", 1)[1]
+            if category in MENU:
+                set_state(chat_id, 0, None, None, None)
+                set_fav_mix_state(chat_id, 0, None)
+                return render_category(chat_id, category)
+            return render_home(chat_id)
 
-    if data == "go:profile":
-        set_state(chat_id, 0, None, None, None)
-        set_fav_mix_state(chat_id, 0, None)
-        return render_profile(chat_id)
+        if data.startswith("item:"):
+            key = data.split("item:", 1)[1]
+            set_state(chat_id, 0, None, None, None)
+            set_fav_mix_state(chat_id, 0, None)
+            return render_item(chat_id, key)
 
-    if data == "go:feedback":
-        set_state(chat_id, 0, None, None, None)
-        set_fav_mix_state(chat_id, 0, None)
-        return render_feedback_root(chat_id)
+        if data == "go:profile":
+            set_state(chat_id, 0, None, None, None)
+            set_fav_mix_state(chat_id, 0, None)
+            return render_profile(chat_id)
 
-    # ✅ NEW FLOW: favorite -> ask mix text
-    if data.startswith("fav:"):
-        key = data.split("fav:", 1)[1]
-        set_state(chat_id, 0, None, None, None)          # stop other pending flows
-        set_fav_mix_state(chat_id, 1, key)               # now awaiting mix
-        return render_fav_mix_prompt(chat_id, key)
+        if data == "go:feedback":
+            set_state(chat_id, 0, None, None, None)
+            set_fav_mix_state(chat_id, 0, None)
+            return render_feedback_root(chat_id)
 
-    # ✅ favorite mix actions
-    if data == "favmix:skip":
-        st = get_state(chat_id)
-        key = (st["pending_fav_item_key"] if st else None)
-        if key:
-            set_favorite_mix(chat_id, key, None)
-        set_fav_mix_state(chat_id, 0, None)
-        return render_home(chat_id)
+        # favorite flow
+        if data.startswith("fav:"):
+            key = data.split("fav:", 1)[1]
+            set_state(chat_id, 0, None, None, None)
+            set_fav_mix_state(chat_id, 1, key)
+            return render_fav_mix_prompt(chat_id, key)
 
-    if data == "favmix:clear":
-        clear_favorite(chat_id)
-        set_fav_mix_state(chat_id, 0, None)
-        return render_home(chat_id)
+        if data == "favmix:skip":
+            st = get_state(chat_id)
+            key = (st["pending_fav_item_key"] if st else None)
+            if key:
+                set_favorite_mix(chat_id, key, None)
+            set_fav_mix_state(chat_id, 0, None)
+            return render_home(chat_id)
 
-    if data.startswith("fbroot:"):
-        kind = data.split("fbroot:", 1)[1]
-        if kind == "service":
-            return render_rate(chat_id, "service", None)
+        if data == "favmix:clear":
+            clear_favorite(chat_id)
+            set_fav_mix_state(chat_id, 0, None)
+            return render_home(chat_id)
 
-        txt = (
-            header("💨 Кальян") +
-            "Щоб оцінити кальян — відкрий позицію в меню\n"
-            "і натисни *⭐ Оцінити ✧*.\n\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "✧ *Меню* ✧\n"
-            "━━━━━━━━━━━━━━━━━━"
-        )
-        kb = InlineKeyboardMarkup()
-        kb.row(
-            InlineKeyboardButton("🌸 Signature ✧", callback_data="cat:Авторські Кальяни"),
-            InlineKeyboardButton("🍊 Фруктові ✧", callback_data="cat:Фруктові Чаші"),
-            InlineKeyboardButton("⚙️ Формат ✧", callback_data="cat:Формат"),
-        )
-        kb.add(InlineKeyboardButton("← Назад", callback_data="go:feedback"))
-        return screen_text(chat_id, txt, kb)
+        # feedback
+        if data.startswith("fbroot:"):
+            kind = data.split("fbroot:", 1)[1]
+            if kind == "service":
+                return render_rate(chat_id, "service", None)
 
-    if data.startswith("fb:"):
-        _, kind, item_key = data.split(":", 2)
-        return render_rate(chat_id, kind, item_key)
+            txt = (
+                header("💨 Кальян") +
+                "Щоб оцінити кальян — відкрий позицію в меню\n"
+                "і натисни *⭐ Оцінити ✧*.\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "✧ *Меню* ✧\n"
+                "━━━━━━━━━━━━━━━━━━"
+            )
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton("🌸 Signature ✧", callback_data="cat:Авторські Кальяни"),
+                InlineKeyboardButton("🍊 Фруктові ✧", callback_data="cat:Фруктові Чаші"),
+                InlineKeyboardButton("⚙️ Формат ✧", callback_data="cat:Формат"),
+            )
+            kb.add(InlineKeyboardButton("← Назад", callback_data="go:feedback"))
+            return screen_text(chat_id, txt, kb)
 
-    if data.startswith("rate:"):
-        _, kind, item_raw, stars_raw = data.split(":", 3)
-        item_key = None if item_raw == "-" else item_raw
-        rating = int(stars_raw)
-        set_fav_mix_state(chat_id, 0, None)  # stop fav flow
-        set_state(chat_id, 1, kind, item_key, rating)
-        return render_after_rating(chat_id)
+        if data.startswith("fb:"):
+            _, kind, item_key = data.split(":", 2)
+            return render_rate(chat_id, kind, item_key)
 
-    if data == "skip_comment":
-        st = get_state(chat_id)
-        if st and int(st["awaiting_comment"] or 0) == 1:
-            add_feedback(chat_id, st["pending_kind"], int(st["pending_rating"]), st["pending_item_key"], None)
-        set_state(chat_id, 0, None, None, None)
-        return render_home(chat_id)
+        if data.startswith("rate:"):
+            _, kind, item_raw, stars_raw = data.split(":", 3)
+            item_key = None if item_raw == "-" else item_raw
+            rating = int(stars_raw)
+            set_fav_mix_state(chat_id, 0, None)
+            set_state(chat_id, 1, kind, item_key, rating)
+            return render_after_rating(chat_id)
 
-    # admin callbacks
-    if chat_id == ADMIN_ID and data.startswith("adminmode:"):
-        v = data.split("adminmode:", 1)[1]
-        set_admin_mode(ADMIN_ID, 1 if v == "on" else 0)
-        mode = "ON ✅" if is_admin_mode(ADMIN_ID) else "OFF ⛔"
-        admin_send(f"Admin Mode: *{mode}*", kb_admin_quick())
-        return
+        if data == "skip_comment":
+            st = get_state(chat_id)
+            if st and int(st["awaiting_comment"] or 0) == 1:
+                add_feedback(chat_id, st["pending_kind"], int(st["pending_rating"]), st["pending_item_key"], None)
+            set_state(chat_id, 0, None, None, None)
+            return render_home(chat_id)
 
-    if chat_id == ADMIN_ID and data.startswith("admin:"):
-        if data == "admin:users":
-            conn = db()
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) as c FROM users")
-            c = cur.fetchone()["c"]
-            conn.close()
-            admin_send(header("Admin") + f"👥 Користувачів: *{c}*", kb_admin_quick())
+        # admin callbacks
+        if ADMIN_ID > 0 and chat_id == ADMIN_ID and data.startswith("adminmode:"):
+            v = data.split("adminmode:", 1)[1]
+            set_admin_mode(ADMIN_ID, 1 if v == "on" else 0)
+            mode = "ON ✅" if is_admin_mode(ADMIN_ID) else "OFF ⛔"
+            admin_send(f"Admin Mode: *{mode}*", kb_admin_quick())
             return
 
-        if data == "admin:keys":
-            admin_send(list_keys_text(), kb_admin_quick())
-            return
-
-        if data == "admin:help":
-            admin_send(admin_help_text(), kb_admin_quick())
-            return
-
-        if data == "admin:lastfb":
-            conn = db()
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM feedback ORDER BY id DESC LIMIT 5")
-            rows = cur.fetchall()
-            conn.close()
-            if not rows:
-                admin_send(header("Last FB") + "Поки нема відгуків.", kb_admin_quick())
+        if ADMIN_ID > 0 and chat_id == ADMIN_ID and data.startswith("admin:"):
+            if data == "admin:users":
+                conn = db()
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) as c FROM users")
+                c = cur.fetchone()["c"]
+                conn.close()
+                admin_send(header("Admin") + f"👥 Користувачів: *{c}*", kb_admin_quick())
                 return
-            lines = [header("Last FB")]
-            for r in rows:
-                lines.append(f"• `{r['created_at']}` — *{r['kind']}* — {r['rating']}★ — `{r['item_key'] or '-'}`")
-                if r["text"]:
-                    lines.append(f"  _{r['text'][:120]}_")
-            admin_send("\n".join(lines), kb_admin_quick())
-            return
 
-    return render_home(chat_id)
+            if data == "admin:keys":
+                admin_send(list_keys_text(), kb_admin_quick())
+                return
 
-# ================== TEXT HANDLER ==================
+            if data == "admin:help":
+                admin_send(admin_help_text(), kb_admin_quick())
+                return
+
+        return render_home(chat_id)
+
+    except Exception:
+        print("❌ CALLBACK CRASH:\n", traceback.format_exc())
+        try:
+            chat_id = call.message.chat.id if call.message else call.from_user.id
+            return render_home(chat_id)
+        except Exception:
+            pass
+
+# ================== TEXT HANDLER (ANTI-CRASH) ==================
 @bot.message_handler(func=lambda m: True)
 def on_text(message):
-    chat_id = message.chat.id
-    ensure_user(chat_id)
-
-    txt = (message.text or "").strip()
-
-    if txt.startswith("/"):
-        return
-
-    # if admin in admin mode -> ignore random texts
-    if message.from_user.id == ADMIN_ID and is_admin_mode(ADMIN_ID):
-        return
-
-    st = get_state(chat_id)
-
-    # ✅ favorite mix input
-    if st and int(st["awaiting_fav_mix"] or 0) == 1:
-        key = st["pending_fav_item_key"]
-        mix = (txt[:COMMENT_MAX]).strip()
-        if key:
-            set_favorite_mix(chat_id, key, mix or None)
-        set_fav_mix_state(chat_id, 0, None)
-        try:
-            bot.delete_message(chat_id, message.message_id)
-        except Exception:
-            pass
-        typing(chat_id)
-        return render_home(chat_id)
-
-    # feedback comment input
-    if st and int(st["awaiting_comment"] or 0) == 1:
-        comment = (txt[:COMMENT_MAX]).strip()
-        add_feedback(chat_id, st["pending_kind"], int(st["pending_rating"]), st["pending_item_key"], comment or None)
-        set_state(chat_id, 0, None, None, None)
-        try:
-            bot.delete_message(chat_id, message.message_id)
-        except Exception:
-            pass
-        typing(chat_id)
-        return render_home(chat_id)
-
-    # optional: guests can type table code "t12"
-    table_code = extract_table_code(txt)
-    if table_code:
-        try_checkin(chat_id, table_code)
-        try:
-            bot.delete_message(chat_id, message.message_id)
-        except Exception:
-            pass
-        typing(chat_id)
-        return render_home(chat_id)
-
     try:
-        bot.delete_message(chat_id, message.message_id)
-    except Exception:
-        pass
+        chat_id = message.chat.id
+        ensure_user(chat_id)
 
-    typing(chat_id)
-    return render_home(chat_id)
+        txt = (message.text or "").strip()
+
+        if txt.startswith("/"):
+            return
+
+        if ADMIN_ID > 0 and message.from_user.id == ADMIN_ID and is_admin_mode(ADMIN_ID):
+            return
+
+        st = get_state(chat_id)
+
+        if st and int(st["awaiting_fav_mix"] or 0) == 1:
+            key = st["pending_fav_item_key"]
+            mix = (txt[:COMMENT_MAX]).strip()
+            if key:
+                set_favorite_mix(chat_id, key, mix or None)
+            set_fav_mix_state(chat_id, 0, None)
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except Exception:
+                pass
+            typing(chat_id)
+            return render_home(chat_id)
+
+        if st and int(st["awaiting_comment"] or 0) == 1:
+            comment = (txt[:COMMENT_MAX]).strip()
+            add_feedback(chat_id, st["pending_kind"], int(st["pending_rating"]), st["pending_item_key"], comment or None)
+            set_state(chat_id, 0, None, None, None)
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except Exception:
+                pass
+            typing(chat_id)
+            return render_home(chat_id)
+
+        table_code = extract_table_code(txt)
+        if table_code:
+            try_checkin(chat_id, table_code)
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except Exception:
+                pass
+            typing(chat_id)
+            return render_home(chat_id)
+
+        try:
+            bot.delete_message(chat_id, message.message_id)
+        except Exception:
+            pass
+
+        typing(chat_id)
+        return render_home(chat_id)
+
+    except Exception:
+        print("❌ TEXT CRASH:\n", traceback.format_exc())
+        try:
+            ensure_user(message.chat.id)
+            return render_home(message.chat.id)
+        except Exception:
+            pass
 
 # ================== RUN ==================
 def start_bot():
@@ -1523,7 +1476,8 @@ def start_bot():
 
     init_db()
     migrate_db()
-    ensure_user(ADMIN_ID)
+    if ADMIN_ID > 0:
+        ensure_user(ADMIN_ID)
     load_media_and_overrides()
 
     print("Bot is running...")
@@ -1531,4 +1485,3 @@ def start_bot():
 
 if __name__ == "__main__":
     start_bot()
-
