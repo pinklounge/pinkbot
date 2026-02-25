@@ -758,7 +758,26 @@ def kb_admin_quick():
         InlineKeyboardButton("⛔ Admin OFF", callback_data="adminmode:off"),
     )
     return kb
+def is_admin_user(message) -> bool:
+    if ADMIN_ID <= 0:
+        return False
+    uid = getattr(message.from_user, "id", None)
+    cid = getattr(message.chat, "id", None)
+    return (uid == ADMIN_ID) or (cid == ADMIN_ID)
 
+@bot.message_handler(commands=["whoami"])
+def whoami_cmd(message):
+    uid = getattr(message.from_user, "id", None)
+    cid = getattr(message.chat, "id", None)
+    bot.send_message(message.chat.id, f"from_user.id = `{uid}`\nchat.id = `{cid}`")
+
+@bot.message_handler(commands=["admin"])
+def admin_cmd(message):
+    if not is_admin_user(message):
+        return
+    ensure_user(ADMIN_ID)
+    mode = "ON ✅" if is_admin_mode(ADMIN_ID) else "OFF ⛔"
+    admin_send(header("Admin") + f"Admin Mode: *{mode}*\n\nШвидкі дії:", kb_admin_quick())
 # ================== SCREENS ==================
 def render_home(chat_id: int):
     u = get_user(chat_id)
@@ -1485,4 +1504,5 @@ def start_bot():
 
 if __name__ == "__main__":
     start_bot()
+
 
