@@ -1,9 +1,10 @@
 # bot.py
 # Pink Lounge Telegram Bot (Railway-ready)
-# ✅ Uses ENV vars: BOT_TOKEN, ADMIN_ID (required)
-# ✅ Fix: /admin works reliably (handler order + from_user.id check)
-# ✅ Fix: Favorite flow -> choose item -> type your mix -> saved (title + mix)
-# ✅ Keeps all existing features: menu UI, feedback, admin media/overrides, broadcast, DB persistence
+# ✅ ENV: BOT_TOKEN, ADMIN_ID (required), BOOK_URL (optional), DB_FILE (optional)
+# ✅ Fix: /admin НЕ крашить (admin_send -> в поточний чат, не в DM)
+# ✅ Fix: admin callbacks працюють в групі (перевірка по call.from_user.id)
+# ✅ Fix: Favorite -> обрав позицію -> ввів мікс -> збереглось (favorite_key + favorite_mix)
+# ✅ Fix: check-in рахує візити кожному (а не лише адміну)
 
 import os
 import re
@@ -324,7 +325,6 @@ def migrate_db():
     conn = db()
     cur = conn.cursor()
 
-    # ui columns
     for col in ("aux_message_id", "admin_message_id", "main_kind"):
         if not _column_exists(cur, "ui", col):
             if col == "main_kind":
@@ -332,11 +332,9 @@ def migrate_db():
             else:
                 cur.execute(f"ALTER TABLE ui ADD COLUMN {col} INTEGER")
 
-    # users new column favorite_mix
     if not _column_exists(cur, "users", "favorite_mix"):
         cur.execute("ALTER TABLE users ADD COLUMN favorite_mix TEXT")
 
-    # state new columns for favorite flow
     if not _column_exists(cur, "state", "awaiting_fav_mix"):
         cur.execute("ALTER TABLE state ADD COLUMN awaiting_fav_mix INTEGER DEFAULT 0")
     if not _column_exists(cur, "state", "pending_fav_key"):
@@ -348,7 +346,6 @@ def migrate_db():
 def ensure_user(chat_id: int):
     conn = db()
     cur = conn.cursor()
-
     cur.execute("INSERT OR IGNORE INTO users(chat_id, created_at) VALUES(?, ?)", (chat_id, utcnow().isoformat()))
     cur.execute("""
         INSERT OR IGNORE INTO state(chat_id, awaiting_comment, awaiting_fav_mix)
@@ -359,7 +356,6 @@ def ensure_user(chat_id: int):
         INSERT OR IGNORE INTO ui(chat_id, main_message_id, aux_message_id, admin_message_id, main_kind)
         VALUES(?, NULL, NULL, NULL, 'text')
     """, (chat_id,))
-
     conn.commit()
     conn.close()
 
@@ -378,6 +374,27 @@ def get_state(chat_id: int):
     row = cur.fetchone()
     conn.close()
     return row
+
+def get_ui(chat_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM ui WHERE chat_id=?", (chat_id,))
+    r = cur.fetchone()
+    conn.close()
+    return r
+
+def set_ui_fields(chat_id: int, **kwargs):
+    if not kwargs:
+        return
+    conn = db()
+    cur = conn.cursor()
+    keys = list(kwargs.keys())
+    sets = ", ".join([f"{k}=?" for k in keys])
+    vals = [kwargs[k] for k in keys]
+    vals.append(chat_id)
+    cur.execute(f"UPDATE ui SET {sets} WHERE chat_id=?", vals)
+    conn.commit()
+    conn.close()
 
 def set_state_feedback(chat_id: int, awaiting: int, kind=None, item_key=None, rating=None):
     conn = db()
@@ -416,7 +433,7 @@ def clear_all_state(chat_id: int):
 def is_admin_mode(chat_id: int) -> bool:
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT admin_mode FROM settings WHERE chat_id=?", (chat_id,))
+    cur.execute("SELECT admin_mode FROM settings WHERE chat_id=?", (ADMIN_ID,))  # always stored for ADMIN_ID
     r = cur.fetchone()
     conn.close()
     return bool(r and int(r["admin_mode"] or 0) == 1)
@@ -428,28 +445,7 @@ def set_admin_mode(chat_id: int, val: int):
         INSERT INTO settings(chat_id, admin_mode)
         VALUES(?, ?)
         ON CONFLICT(chat_id) DO UPDATE SET admin_mode=excluded.admin_mode
-    """, (chat_id, val))
-    conn.commit()
-    conn.close()
-
-def get_ui(chat_id: int):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM ui WHERE chat_id=?", (chat_id,))
-    r = cur.fetchone()
-    conn.close()
-    return r
-
-def set_ui_fields(chat_id: int, **kwargs):
-    if not kwargs:
-        return
-    conn = db()
-    cur = conn.cursor()
-    keys = list(kwargs.keys())
-    sets = ", ".join([f"{k}=?" for k in keys])
-    vals = [kwargs[k] for k in keys]
-    vals.append(chat_id)
-    cur.execute(f"UPDATE ui SET {sets} WHERE chat_id=?", vals)
+    """, (ADMIN_ID, val))
     conn.commit()
     conn.close()
 
@@ -929,7 +925,7 @@ def admin_help_text():
         "• (media) caption: `broadcast:текст` — фото/відео розсилка\n"
     )
 
-# ================== ADMIN STATE ==================
+# ================== ADMIN HELPERS ==================
 admin_state = {}  # {ADMIN_ID: {"mode": "setphoto"/"setvideo", "key": "..."}}
 
 def detect_doc_kind(document) -> str | None:
@@ -949,17 +945,36 @@ def is_admin_message(message) -> bool:
     except Exception:
         return False
 
-def admin_send(text: str, kb=None):
-    if not is_admin_mode(ADMIN_ID):
-        ui = get_ui(ADMIN_ID)
-        if ui:
-            safe_delete(ADMIN_ID, ui["admin_message_id"])
-    msg = bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode="Markdown")
-    if not is_admin_mode(ADMIN_ID):
-        set_ui_fields(ADMIN_ID, admin_message_id=msg.message_id)
-    return msg
+def admin_send(chat_id: int, text: str, kb=None):
+    """
+    Send admin output to the SAME chat where admin invoked the action.
+    Prevents crash when bot can't DM the admin.
+    """
+    try:
+        # optional: keep one panel message clean when admin_mode is OFF
+        if not is_admin_mode(ADMIN_ID):
+            ui = get_ui(chat_id)
+            if ui:
+                safe_delete(chat_id, ui["admin_message_id"])
 
-# ================== COMMANDS (KEEP THESE ABOVE on_text!) ==================
+        msg = bot.send_message(chat_id, text, reply_markup=kb, parse_mode="Markdown")
+
+        if not is_admin_mode(ADMIN_ID):
+            set_ui_fields(chat_id, admin_message_id=msg.message_id)
+
+        return msg
+    except Exception:
+        # fallback without markdown
+        try:
+            clean = re.sub(r"[*_`]", "", text)
+            msg = bot.send_message(chat_id, clean, reply_markup=kb)
+            if not is_admin_mode(ADMIN_ID):
+                set_ui_fields(chat_id, admin_message_id=msg.message_id)
+            return msg
+        except Exception:
+            return None
+
+# ================== COMMANDS (MUST BE ABOVE on_text) ==================
 @bot.message_handler(commands=["whoami"])
 def whoami_cmd(message):
     uid = getattr(message.from_user, "id", None)
@@ -993,9 +1008,9 @@ def start(message):
 def admin_cmd(message):
     if not is_admin_message(message):
         return
-    ensure_user(ADMIN_ID)
+    ensure_user(message.chat.id)
     mode = "ON ✅" if is_admin_mode(ADMIN_ID) else "OFF ⛔"
-    admin_send(header("Admin") + f"Admin Mode: *{mode}*\n\nШвидкі дії:", kb_admin_quick())
+    admin_send(message.chat.id, header("Admin") + f"Admin Mode: *{mode}*\n\nШвидкі дії:", kb_admin_quick())
 
 @bot.message_handler(commands=["adminmode"])
 def adminmode_cmd(message):
@@ -1003,18 +1018,18 @@ def adminmode_cmd(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        admin_send("Формат: `/adminmode on` або `/adminmode off`")
+        admin_send(message.chat.id, "Формат: `/adminmode on` або `/adminmode off`")
         return
     v = parts[1].strip().lower()
     set_admin_mode(ADMIN_ID, 1 if v in ("on", "1", "true", "yes") else 0)
     mode = "ON ✅" if is_admin_mode(ADMIN_ID) else "OFF ⛔"
-    admin_send(f"Готово. Admin Mode: *{mode}*", kb_admin_quick())
+    admin_send(message.chat.id, f"Готово. Admin Mode: *{mode}*", kb_admin_quick())
 
 @bot.message_handler(commands=["keys"])
 def keys_cmd(message):
     if not is_admin_message(message):
         return
-    admin_send(list_keys_text(), kb_admin_quick())
+    admin_send(message.chat.id, list_keys_text(), kb_admin_quick())
 
 @bot.message_handler(commands=["setphoto"])
 def setphoto_cmd(message):
@@ -1022,15 +1037,15 @@ def setphoto_cmd(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        admin_send("Формат: `/setphoto SIGNATURE_TROPICAL`")
+        admin_send(message.chat.id, "Формат: `/setphoto SIGNATURE_TROPICAL`")
         return
     key = parts[1].strip()
     cat, item = find_item(key)
     if not item:
-        admin_send("Не знайшов KEY. Натисни `/keys`.")
+        admin_send(message.chat.id, "Не знайшов KEY. Натисни `/keys`.")
         return
     admin_state[ADMIN_ID] = {"mode": "setphoto", "key": key}
-    admin_send(f"✅ Надішли *фото* (як фото або файл) для:\n{cat} → {item['title']}")
+    admin_send(message.chat.id, f"✅ Надішли *фото* (як фото або файл) для:\n{cat} → {item['title']}")
 
 @bot.message_handler(commands=["setvideo"])
 def setvideo_cmd(message):
@@ -1038,15 +1053,15 @@ def setvideo_cmd(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        admin_send("Формат: `/setvideo SIGNATURE_TROPICAL`")
+        admin_send(message.chat.id, "Формат: `/setvideo SIGNATURE_TROPICAL`")
         return
     key = parts[1].strip()
     cat, item = find_item(key)
     if not item:
-        admin_send("Не знайшов KEY. Натисни `/keys`.")
+        admin_send(message.chat.id, "Не знайшов KEY. Натисни `/keys`.")
         return
     admin_state[ADMIN_ID] = {"mode": "setvideo", "key": key}
-    admin_send(f"✅ Надішли *відео* (як відео або файл) для:\n{cat} → {item['title']}")
+    admin_send(message.chat.id, f"✅ Надішли *відео* (як відео або файл) для:\n{cat} → {item['title']}")
 
 @bot.message_handler(commands=["delphoto"])
 def delphoto_cmd(message):
@@ -1054,14 +1069,14 @@ def delphoto_cmd(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        admin_send("Формат: `/delphoto KEY`")
+        admin_send(message.chat.id, "Формат: `/delphoto KEY`")
         return
     key = parts[1].strip()
     if not find_item(key)[1]:
-        admin_send("Не знайшов KEY. `/keys`")
+        admin_send(message.chat.id, "Не знайшов KEY. `/keys`")
         return
     media_set(key, "photo", None)
-    admin_send(f"✅ Фото видалено для `{key}`")
+    admin_send(message.chat.id, f"✅ Фото видалено для `{key}`", kb_admin_quick())
 
 @bot.message_handler(commands=["delvideo"])
 def delvideo_cmd(message):
@@ -1069,14 +1084,14 @@ def delvideo_cmd(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        admin_send("Формат: `/delvideo KEY`")
+        admin_send(message.chat.id, "Формат: `/delvideo KEY`")
         return
     key = parts[1].strip()
     if not find_item(key)[1]:
-        admin_send("Не знайшов KEY. `/keys`")
+        admin_send(message.chat.id, "Не знайшов KEY. `/keys`")
         return
     media_set(key, "video", None)
-    admin_send(f"✅ Відео видалено для `{key}`")
+    admin_send(message.chat.id, f"✅ Відео видалено для `{key}`", kb_admin_quick())
 
 @bot.message_handler(commands=["setprice"])
 def setprice_cmd(message):
@@ -1084,21 +1099,21 @@ def setprice_cmd(message):
         return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
-        admin_send("Формат: `/setprice KEY 650`")
+        admin_send(message.chat.id, "Формат: `/setprice KEY 650`")
         return
     key = parts[1].strip()
     if not find_item(key)[1]:
-        admin_send("Не знайшов KEY. `/keys`")
+        admin_send(message.chat.id, "Не знайшов KEY. `/keys`")
         return
     try:
         price = int(parts[2].strip())
         if price < 0:
             raise ValueError
     except Exception:
-        admin_send("Ціна має бути числом (наприклад 650).")
+        admin_send(message.chat.id, "Ціна має бути числом (наприклад 650).")
         return
     overrides_set(key, price=price)
-    admin_send(f"✅ Ціну оновлено: `{key}` → *{price} грн*")
+    admin_send(message.chat.id, f"✅ Ціну оновлено: `{key}` → *{price} грн*", kb_admin_quick())
 
 @bot.message_handler(commands=["settitle"])
 def settitle_cmd(message):
@@ -1106,14 +1121,14 @@ def settitle_cmd(message):
         return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
-        admin_send("Формат: `/settitle KEY Нова назва`")
+        admin_send(message.chat.id, "Формат: `/settitle KEY Нова назва`")
         return
     key = parts[1].strip()
     if not find_item(key)[1]:
-        admin_send("Не знайшов KEY. `/keys`")
+        admin_send(message.chat.id, "Не знайшов KEY. `/keys`")
         return
     overrides_set(key, title=parts[2].strip())
-    admin_send(f"✅ Назву оновлено: `{key}`")
+    admin_send(message.chat.id, f"✅ Назву оновлено: `{key}`", kb_admin_quick())
 
 @bot.message_handler(commands=["setdesc"])
 def setdesc_cmd(message):
@@ -1121,14 +1136,14 @@ def setdesc_cmd(message):
         return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
-        admin_send("Формат: `/setdesc KEY Опис...`")
+        admin_send(message.chat.id, "Формат: `/setdesc KEY Опис...`")
         return
     key = parts[1].strip()
     if not find_item(key)[1]:
-        admin_send("Не знайшов KEY. `/keys`")
+        admin_send(message.chat.id, "Не знайшов KEY. `/keys`")
         return
     overrides_set(key, desc=parts[2].strip())
-    admin_send(f"✅ Опис оновлено: `{key}`")
+    admin_send(message.chat.id, f"✅ Опис оновлено: `{key}`", kb_admin_quick())
 
 @bot.message_handler(commands=["broadcast"])
 def broadcast_text(message):
@@ -1136,7 +1151,7 @@ def broadcast_text(message):
         return
     text = (message.text or "").replace("/broadcast", "", 1).strip()
     if not text:
-        admin_send("Формат: `/broadcast Текст`")
+        admin_send(message.chat.id, "Формат: `/broadcast Текст`")
         return
 
     conn = db()
@@ -1153,7 +1168,8 @@ def broadcast_text(message):
             time.sleep(0.05)
         except Exception:
             pass
-    admin_send(f"✅ Розсилка: {ok}/{len(users)}")
+
+    admin_send(message.chat.id, f"✅ Розсилка: {ok}/{len(users)}", kb_admin_quick())
 
 # ================== MEDIA HANDLER ==================
 @bot.message_handler(content_types=["photo", "video", "document"])
@@ -1188,18 +1204,18 @@ def media_router(message):
             admin_state.pop(ADMIN_ID, None)
             if find_item(key)[1]:
                 media_set(key, "photo", file_id)
-                admin_send(f"✅ Фото привʼязано для `{key}`")
+                admin_send(message.chat.id, f"✅ Фото привʼязано для `{key}`", kb_admin_quick())
             else:
-                admin_send("❗️KEY не знайдено. `/keys`")
+                admin_send(message.chat.id, "❗️KEY не знайдено. `/keys`", kb_admin_quick())
             return
 
         if mode == "setvideo" and kind == "video":
             admin_state.pop(ADMIN_ID, None)
             if find_item(key)[1]:
                 media_set(key, "video", file_id)
-                admin_send(f"✅ Відео привʼязано для `{key}`")
+                admin_send(message.chat.id, f"✅ Відео привʼязано для `{key}`", kb_admin_quick())
             else:
-                admin_send("❗️KEY не знайдено. `/keys`")
+                admin_send(message.chat.id, "❗️KEY не знайдено. `/keys`", kb_admin_quick())
             return
 
     if caption.lower().startswith("broadcast:"):
@@ -1222,7 +1238,8 @@ def media_router(message):
                 time.sleep(0.08 if kind == "video" else 0.06)
             except Exception:
                 pass
-        admin_send(f"✅ {('Відео' if kind=='video' else 'Фото')}-розсилка: {ok}/{len(users)}")
+
+        admin_send(message.chat.id, f"✅ {('Відео' if kind=='video' else 'Фото')}-розсилка: {ok}/{len(users)}", kb_admin_quick())
         return
 
 # ================== CALLBACKS ==================
@@ -1321,30 +1338,30 @@ def on_callback(call):
         set_state_feedback(chat_id, 0, None, None, None)
         return render_home(chat_id)
 
-    # admin callbacks
-    if chat_id == ADMIN_ID and data.startswith("adminmode:"):
+    # ================== ADMIN CALLBACKS (FIXED) ==================
+    if int(getattr(call.from_user, "id", 0)) == ADMIN_ID and data.startswith("adminmode:"):
         v = data.split("adminmode:", 1)[1]
         set_admin_mode(ADMIN_ID, 1 if v == "on" else 0)
         mode = "ON ✅" if is_admin_mode(ADMIN_ID) else "OFF ⛔"
-        admin_send(f"Admin Mode: *{mode}*", kb_admin_quick())
+        admin_send(chat_id, f"Admin Mode: *{mode}*", kb_admin_quick())
         return
 
-    if chat_id == ADMIN_ID and data.startswith("admin:"):
+    if int(getattr(call.from_user, "id", 0)) == ADMIN_ID and data.startswith("admin:"):
         if data == "admin:users":
             conn = db()
             cur = conn.cursor()
             cur.execute("SELECT COUNT(*) as c FROM users")
             c = cur.fetchone()["c"]
             conn.close()
-            admin_send(header("Admin") + f"👥 Користувачів: *{c}*", kb_admin_quick())
+            admin_send(chat_id, header("Admin") + f"👥 Користувачів: *{c}*", kb_admin_quick())
             return
 
         if data == "admin:keys":
-            admin_send(list_keys_text(), kb_admin_quick())
+            admin_send(chat_id, list_keys_text(), kb_admin_quick())
             return
 
         if data == "admin:help":
-            admin_send(admin_help_text(), kb_admin_quick())
+            admin_send(chat_id, admin_help_text(), kb_admin_quick())
             return
 
         if data == "admin:lastfb":
@@ -1354,7 +1371,7 @@ def on_callback(call):
             r = cur.fetchone()
             conn.close()
             if not r:
-                admin_send(header("Last FB") + "Немає відгуків.", kb_admin_quick())
+                admin_send(chat_id, header("Last FB") + "Немає відгуків.", kb_admin_quick())
                 return
             txt = (
                 header("Last FB") +
@@ -1365,7 +1382,7 @@ def on_callback(call):
                 f"text: {r['text'] or '—'}\n"
                 f"at: `{r['created_at']}`"
             )
-            admin_send(txt, kb_admin_quick())
+            admin_send(chat_id, txt, kb_admin_quick())
             return
 
     return render_home(chat_id)
@@ -1378,17 +1395,17 @@ def on_text(message):
 
     txt = (message.text or "").strip()
 
-    # ignore commands here (commands handled above)
+    # commands handled above
     if txt.startswith("/"):
         return
 
-    # if admin in admin_mode -> do nothing on random text
+    # if admin in admin_mode -> ignore random text
     if is_admin_message(message) and is_admin_mode(ADMIN_ID):
         return
 
     st = get_state(chat_id)
 
-    # Favorite mix awaiting
+    # Favorite awaiting
     if st and int(st["awaiting_fav_mix"] or 0) == 1:
         key = st["pending_fav_key"]
         mix = (txt[:FAV_MIX_MAX]).strip()
@@ -1414,7 +1431,7 @@ def on_text(message):
         typing(chat_id)
         return render_home(chat_id)
 
-    # default: delete stray user text + return home
+    # default: delete stray text + return home
     try:
         bot.delete_message(chat_id, message.message_id)
     except Exception:
