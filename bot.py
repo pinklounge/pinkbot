@@ -21,24 +21,28 @@ from telebot.types import (
 )
 
 # ================== CONFIG (ENV) ==================
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+import os
+
+TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or "").strip()
+ADMIN_ID_RAW = (os.getenv("ADMIN_ID") or "").strip()
+
+# FALLBACKS (на випадок якщо Railway не підтягує змінні)
+FALLBACK_ADMIN_ID = 641359493
+FALLBACK_TOKEN = ""  # можеш вставити токен сюди ТІЛЬКИ якщо треба терміново
+
+if not TOKEN:
+    TOKEN = FALLBACK_TOKEN
+
+if not ADMIN_ID_RAW.isdigit():
+    ADMIN_ID = FALLBACK_ADMIN_ID
+else:
+    ADMIN_ID = int(ADMIN_ID_RAW)
 
 if not TOKEN or ":" not in TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN is missing/invalid. Set Railway Variable BOT_TOKEN.")
-if not ADMIN_ID_RAW or not ADMIN_ID_RAW.isdigit():
-    raise RuntimeError("❌ ADMIN_ID is missing. Set Railway Variable ADMIN_ID to your Telegram user id (number).")
-
-ADMIN_ID = int(ADMIN_ID_RAW)
+    raise RuntimeError("❌ BOT_TOKEN is missing/invalid. Set Railway Variable BOT_TOKEN (or TOKEN).")
 
 BOOK_URL = os.getenv("BOOK_URL", "https://www.instagram.com/rozhevyi.sushi.lounge/").strip()
 DB_FILE = os.getenv("DB_FILE", "pink_lounge.db").strip()
-
-bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
-
-apihelper.CONNECT_TIMEOUT = 10
-apihelper.READ_TIMEOUT = 30
-
 # ================== TIME ==================
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -1171,6 +1175,15 @@ def broadcast_text(message):
 
     admin_send(message.chat.id, f"✅ Розсилка: {ok}/{len(users)}", kb_admin_quick())
 
+@bot.message_handler(commands=["envcheck"])
+def envcheck(message):
+    if int(getattr(message.from_user, "id", 0)) != ADMIN_ID:
+        return
+    bot.send_message(
+        message.chat.id,
+        f"ADMIN_ID_RAW=`{os.getenv('ADMIN_ID')}`\nBOT_TOKEN_SET=`{bool(os.getenv('BOT_TOKEN'))}`"
+    )
+
 # ================== MEDIA HANDLER ==================
 @bot.message_handler(content_types=["photo", "video", "document"])
 def media_router(message):
@@ -1457,3 +1470,4 @@ def start_bot():
 
 if __name__ == "__main__":
     start_bot()
+
