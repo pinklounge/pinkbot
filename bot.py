@@ -1,17 +1,15 @@
-import os
 import time
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+import requests
 import telebot
 from telebot import apihelper
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
 # ================== CONFIG ==================
-# ⚠️ РЕКОМЕНДАЦІЯ: тримай TOKEN/ADMIN_ID в env, але щоб було "готово" — лишаю як константи.
-TOKEN = "PASTE_NEW_TOKEN_HERE"
+TOKEN = "8527527033:AAEzO4YbUuvhJGuyZ4v8cNn3JVYnBlmH-ro"  # MUST BE LIKE: 123456:ABC...
 ADMIN_ID = 641359493
-
 BOOK_URL = "https://www.instagram.com/rozhevyi.sushi.lounge/"
 DB_FILE = "pink_lounge.db"
 
@@ -21,15 +19,12 @@ apihelper.CONNECT_TIMEOUT = 10
 apihelper.READ_TIMEOUT = 30
 
 # ================== TIME ==================
-def utcnow_naive() -> datetime:
-    """Return naive datetime that represents UTC time (for simple ISO storage)."""
+def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 ANIM_DELAY = 0.18
 COMMENT_MAX = 100
-
-# ✅ 8 годин замість 24 (UTC)
-VISIT_COOLDOWN_HOURS = 8
+VISIT_COOLDOWN_HOURS = 24
 
 # ================== MENU ==================
 MENU = {
@@ -305,6 +300,7 @@ def migrate_db():
     conn = db()
     cur = conn.cursor()
 
+    # older DBs: ui may miss columns
     for col in ("aux_message_id", "admin_message_id", "main_kind"):
         if not _column_exists(cur, "ui", col):
             if col == "main_kind":
@@ -319,10 +315,7 @@ def ensure_user(chat_id: int):
     conn = db()
     cur = conn.cursor()
 
-    cur.execute(
-        "INSERT OR IGNORE INTO users(chat_id, created_at) VALUES(?, ?)",
-        (chat_id, utcnow_naive().isoformat())
-    )
+    cur.execute("INSERT OR IGNORE INTO users(chat_id, created_at) VALUES(?, ?)", (chat_id, utcnow().isoformat()))
     cur.execute("INSERT OR IGNORE INTO state(chat_id, awaiting_comment) VALUES(?, 0)", (chat_id,))
     cur.execute("INSERT OR IGNORE INTO settings(chat_id, admin_mode) VALUES(?, 0)", (chat_id,))
     cur.execute("""
@@ -424,46 +417,28 @@ def status_from_visits(v: int) -> str:
     if v >= 10: return "Pink Insider"
     return "Guest"
 
-# ✅ НАДІЙНИЙ checkin: тільки QR, cooldown 8 годин UTC, атомарно
-def try_checkin(chat_id: int, table_code: str | None) -> bool:
-    now = utcnow_naive()
+def try_checkin(chat_id: int, table_code: str | None):
+    u = get_user(chat_id)
+    now = utcnow()
 
-    conn = db()
-    cur = conn.cursor()
-
-    # транзакційний lock, щоб 2 одночасні апдейти не з’їли visits
-    cur.execute("BEGIN IMMEDIATE")
-
-    cur.execute("SELECT visits, last_visit FROM users WHERE chat_id=?", (chat_id,))
-    u = cur.fetchone()
-    if not u:
-        conn.rollback()
-        conn.close()
-        return False
-
-    if u["last_visit"]:
+    if u and u["last_visit"]:
         try:
             last = datetime.fromisoformat(u["last_visit"])
             if now - last < timedelta(hours=VISIT_COOLDOWN_HOURS):
-                conn.rollback()
-                conn.close()
                 return False
         except Exception:
-            # якщо формат зламаний — не блокуємо
             pass
 
-    visits_new = int(u["visits"] or 0) + 1
-    st = status_from_visits(visits_new)
+    visits = int(u["visits"] or 0) + 1
+    st = status_from_visits(visits)
 
+    conn = db()
+    cur = conn.cursor()
     cur.execute("""
         UPDATE users
-        SET visits = visits + 1,
-            last_visit = ?,
-            status = ?,
-            last_table = ?
-        WHERE chat_id = ?
-    """, (now.isoformat(), st, table_code, chat_id))
-
+        SET visits=?, last_visit=?, status=?, last_table=?
+        WHERE chat_id=?
+    """, (visits, now.isoformat(), st, table_code, chat_id))
     conn.commit()
     conn.close()
     return True
@@ -481,7 +456,7 @@ def add_feedback(chat_id: int, kind: str, rating: int, item_key: str | None, tex
     cur.execute("""
         INSERT INTO feedback(chat_id, created_at, kind, item_key, rating, text)
         VALUES(?,?,?,?,?,?)
-    """, (chat_id, utcnow_naive().isoformat(), kind, item_key, rating, text))
+    """, (chat_id, utcnow().isoformat(), kind, item_key, rating, text))
     conn.commit()
     conn.close()
 
@@ -495,7 +470,7 @@ def find_item(item_key: str):
 def media_set(item_key: str, media_type: str, file_id: str | None):
     conn = db()
     cur = conn.cursor()
-    now = utcnow_naive().isoformat()
+    now = utcnow().isoformat()
 
     if media_type == "photo":
         cur.execute("""
@@ -527,7 +502,7 @@ def media_set(item_key: str, media_type: str, file_id: str | None):
 def overrides_set(item_key: str, title=None, desc=None, price=None):
     conn = db()
     cur = conn.cursor()
-    now = utcnow_naive().isoformat()
+    now = utcnow().isoformat()
 
     cur.execute("SELECT * FROM menu_overrides WHERE item_key=?", (item_key,))
     row = cur.fetchone()
@@ -582,12 +557,13 @@ def load_media_and_overrides():
 
     conn.close()
 
-# ================== SCREEN SYSTEM ==================
+# ================== SCREEN SYSTEM (TEXT/PHOTO IN ONE MESSAGE) ==================
 def screen_text(chat_id: int, text: str, kb: InlineKeyboardMarkup):
     ui = get_ui(chat_id)
     mid = ui["main_message_id"] if ui else None
     kind = (ui["main_kind"] if ui else "text") or "text"
 
+    # if current main is photo -> must delete and send new text
     if mid and kind != "text":
         safe_delete(chat_id, mid)
         mid = None
@@ -607,11 +583,13 @@ def screen_photo(chat_id: int, photo_file_id: str, caption: str, kb: InlineKeybo
     mid = ui["main_message_id"] if ui else None
     kind = (ui["main_kind"] if ui else "text") or "text"
 
+    # if current main is text -> must delete and send new photo
     if mid and kind != "photo":
         safe_delete(chat_id, mid)
         mid = None
 
     if mid:
+        # try edit caption + keyboard
         try:
             bot.edit_message_caption(chat_id=chat_id, message_id=mid, caption=caption, reply_markup=kb, parse_mode="Markdown")
             return
@@ -713,7 +691,7 @@ def kb_admin_quick():
     return kb
 
 # ================== SCREENS ==================
-def render_home(chat_id: int, toast: str | None = None):
+def render_home(chat_id: int):
     u = get_user(chat_id)
     status = (u["status"] or "Guest")
     visits = int(u["visits"] or 0)
@@ -734,11 +712,8 @@ def render_home(chat_id: int, toast: str | None = None):
         if it:
             fav = it["title"]
 
-    toast_line = f"{toast}\n\n" if toast else ""
-
     text = (
         header("Pink Lounge") +
-        toast_line +
         f"{welcome}\n\n"
         f"👑 *Статус:* {status}\n"
         f"📌 *Візити:* {visits}\n"
@@ -778,6 +753,7 @@ def render_item(chat_id: int, item_key: str):
         "━━━━━━━━━━━━━━━━━━"
     )
 
+    # IMPORTANT: photo+text in ONE message
     if item.get("photo_file_id"):
         screen_photo(chat_id, item["photo_file_id"], caption, kb_item(item_key))
     else:
@@ -918,12 +894,10 @@ def start(message):
     parts = (message.text or "").split(maxsplit=1)
     start_param = parts[1].strip() if len(parts) > 1 else None
 
-    # ✅ Візит РАХУЄМО ТІЛЬКИ якщо /start t123
     if start_param and start_param.lower().startswith("t") and start_param[1:].isdigit():
-        ok = try_checkin(chat_id, start_param.lower())
+        try_checkin(chat_id, start_param.lower())
         set_state(chat_id, 0, None, None, None)
-        toast = "✅ *Візит зараховано!*" if ok else f"⏳ *Візит вже був нещодавно.*\nСпробуй ще раз пізніше (cooldown {VISIT_COOLDOWN_HOURS} год)."
-        return render_home(chat_id, toast=toast)
+        return render_home(chat_id)
 
     set_state(chat_id, 0, None, None, None)
     return render_home(chat_id)
@@ -1314,9 +1288,6 @@ def on_text(message):
 
 # ================== RUN ==================
 def start_bot():
-    if TOKEN == "PASTE_NEW_TOKEN_HERE" or not TOKEN:
-        raise RuntimeError("❌ Set TOKEN in bot.py (or move it to env).")
-
     try:
         bot.remove_webhook()
         time.sleep(1)
