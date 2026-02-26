@@ -7,7 +7,7 @@ from telebot import apihelper
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 
 # ================== CONFIG ==================
-TOKEN = "PASTE_NEW_TOKEN_HERE"  # ⚠️ Заміни на НОВИЙ токен (перевипусти в BotFather)
+TOKEN = "8527527033:AAEzO4YbUuvhJGuyZ4v8cNn3JVYnBlmH-ro"  # ⚠️ Заміни на НОВИЙ токен (перевипусти в BotFather)
 ADMIN_ID = 641359493
 BOOK_URL = "https://www.instagram.com/rozhevyi.sushi.lounge/"
 DB_FILE = "pink_lounge.db"
@@ -1398,3 +1398,4 @@ def start_bot():
 
 if __name__ == "__main__":
     start_bot()
+
